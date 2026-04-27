@@ -1,0 +1,317 @@
+<script>
+/**
+ * Client-side logic.
+ * The CHARTS_READY / RAW pattern protects against a common silent-failure mode:
+ * google.charts.load is async, so if data arrives first we'd try to render
+ * before the chart packages exist. We only render once BOTH are ready.
+ */
+let RAW = null;
+let CHARTS_READY = false;
+
+google.charts.load('current', { packages: ['corechart', 'bar', 'line'] });
+google.charts.setOnLoadCallback(() => { CHARTS_READY = true; tryRender(); });
+
+const DEFAULT_YEAR = '2026';
+
+document.addEventListener('DOMContentLoaded', () => {
+  ['yearFilter','regionFilter','categoryFilter','memberFilter','fromDate','toDate']
+    .forEach(id => document.getElementById(id).addEventListener('change', renderAll));
+  document.getElementById('refreshBtn').addEventListener('click', loadData);
+
+  // Re-draw on resize so charts stay responsive
+  let resizeT;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeT);
+    resizeT = setTimeout(renderAll, 150);
+  });
+
+  loadData();
+});
+
+/* ---------------------- server I/O ---------------------- */
+function loadData() {
+  showLoader(true);
+  google.script.run
+    .withSuccessHandler(handlePayload)
+    .withFailureHandler(err => showError((err && err.message) || err))
+    .getDashboardData();
+}
+
+function handlePayload(data) {
+  if (!data || !data.ok) { showError(data && data.error || 'Unknown server error'); return; }
+  if (data.empty) {
+    showLoader(false);
+    document.getElementById('emptyBox').classList.remove('d-none');
+    return;
+  }
+  RAW = data;
+  populateFilters(data.filters);
+  populateYearFilter(data.rows);
+  showLoader(false);
+  document.getElementById('dashboard').classList.remove('d-none');
+  tryRender();
+}
+
+/* Build the Year dropdown from the data, plus DEFAULT_YEAR if it's missing.
+   Pre-selects DEFAULT_YEAR (2026). */
+function populateYearFilter(rows) {
+  const sel = document.getElementById('yearFilter');
+  while (sel.options.length > 1) sel.remove(1);
+
+  const years = new Set(rows.map(r => (r.Date || '').slice(0, 4)).filter(Boolean));
+  years.add(DEFAULT_YEAR);
+
+  [...years].sort().forEach(y => sel.add(new Option(y, y)));
+  sel.value = DEFAULT_YEAR;
+}
+
+function tryRender() { if (CHARTS_READY && RAW) renderAll(); }
+
+/* ---------------------- filters ---------------------- */
+function populateFilters({ regions, categories }) {
+  const reg = document.getElementById('regionFilter');
+  while (reg.options.length > 1) reg.remove(1);
+  regions.forEach(r => reg.add(new Option(r, r)));
+
+  const cat = document.getElementById('categoryFilter');
+  while (cat.options.length > 1) cat.remove(1);
+  categories.forEach(c => cat.add(new Option(c, c)));
+}
+
+function getFilters() {
+  return {
+    year:     document.getElementById('yearFilter').value,
+    region:   document.getElementById('regionFilter').value,
+    category: document.getElementById('categoryFilter').value,
+    member:   document.getElementById('memberFilter').value,
+    from:     document.getElementById('fromDate').value,
+    to:       document.getElementById('toDate').value
+  };
+}
+
+function applyFilters(rows) {
+  const f = getFilters();
+  return rows.filter(r => {
+    if (f.year     && r.Date.slice(0, 4) !== f.year) return false;
+    if (f.region   && r.Region !== f.region) return false;
+    if (f.category && r.Product_Category !== f.category) return false;
+    if (f.member   && String(r.Is_Member) !== f.member) return false;
+    if (f.from     && r.Date < f.from) return false;
+    if (f.to       && r.Date > f.to)   return false;
+    return true;
+  });
+}
+
+/* ---------------------- master render ---------------------- */
+function renderAll() {
+  if (!RAW || !CHARTS_READY) return;
+  try {
+    const rows = applyFilters(RAW.rows);
+    if (!rows.length) {
+      ['monthlyChart','regionChart','categoryChart','ratingChart','stackedChart','memberChart']
+        .forEach(id => document.getElementById(id).innerHTML =
+          '<div class="text-muted text-center pt-5">No data for the selected filters.</div>');
+      document.querySelector('#dataTable tbody').innerHTML = '';
+      document.getElementById('tableInfo').textContent = '0 rows';
+      renderKpis([]);
+      return;
+    }
+    renderKpis(rows);
+    renderMonthly(rows);
+    renderRegion(rows);
+    renderCategory(rows);
+    renderRating(rows);
+    renderStacked(rows);
+    renderMember(rows);
+    renderTable(rows);
+  } catch (e) {
+    showError(e.message || String(e));
+  }
+}
+
+/* ---------------------- formatters ---------------------- */
+const usd = v => (v || 0).toLocaleString('en-US', { style:'currency', currency:'USD', maximumFractionDigits:0 });
+const num = v => (v || 0).toLocaleString('en-US');
+
+/* ---------------------- KPIs ---------------------- */
+function renderKpis(rows) {
+  const total  = rows.reduce((a,r)=>a+r.Total_Sales,0);
+  const tx     = rows.length;
+  const units  = rows.reduce((a,r)=>a+r.Quantity,0);
+  const aov    = tx ? total/tx : 0;
+  const rating = tx ? rows.reduce((a,r)=>a+r.Customer_Rating,0)/tx : 0;
+  const cards = [
+    { lbl:'Total Sales',     val: usd(total),  icon:'bi-cash-coin',      color:'primary' },
+    { lbl:'Transactions',    val: num(tx),     icon:'bi-receipt',        color:'info' },
+    { lbl:'Units Sold',      val: num(units),  icon:'bi-box-seam',       color:'success' },
+    { lbl:'Avg Order Value', val: usd(aov),    icon:'bi-graph-up-arrow', color:'warning' },
+    { lbl:'Avg Rating',      val: rating.toFixed(2)+' ★', icon:'bi-star-fill', color:'danger' }
+  ];
+  document.getElementById('kpiRow').innerHTML = cards.map(c => `
+    <div class="col-lg col-md-4 col-6">
+      <div class="card border-0 shadow-sm kpi-card h-100">
+        <div class="card-body">
+          <div class="d-flex align-items-center">
+            <div class="kpi-icon bg-${c.color}-subtle text-${c.color}">
+              <i class="bi ${c.icon}"></i>
+            </div>
+            <div class="ms-3">
+              <div class="text-muted small">${c.lbl}</div>
+              <div class="fs-5 fw-bold">${c.val}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`).join('');
+}
+
+/* ---------------------- charts ---------------------- */
+function renderMonthly(rows) {
+  const map = {};
+  rows.forEach(r => { const ym = r.Date.slice(0,7); map[ym] = (map[ym]||0) + r.Total_Sales; });
+  const dt = new google.visualization.DataTable();
+  dt.addColumn('string', 'Month');
+  dt.addColumn('number', 'Sales');
+  Object.keys(map).sort().forEach(k => dt.addRow([k, map[k]]));
+  new google.visualization.AreaChart(document.getElementById('monthlyChart')).draw(dt, {
+    legend: { position: 'none' },
+    colors: ['#0d6efd'],
+    chartArea: { left: 70, right: 20, top: 20, bottom: 50, width: '100%', height: '78%' },
+    vAxis: { format: 'short' },
+    hAxis: { slantedText: true, slantedTextAngle: 30, textStyle: { fontSize: 11 } },
+    backgroundColor: 'transparent'
+  });
+}
+
+function renderRegion(rows) {
+  const map = {};
+  rows.forEach(r => map[r.Region] = (map[r.Region]||0) + r.Total_Sales);
+  const dt = new google.visualization.DataTable();
+  dt.addColumn('string', 'Region');
+  dt.addColumn('number', 'Sales');
+  Object.entries(map).sort((a,b)=>b[1]-a[1]).forEach(([k,v]) => dt.addRow([k,v]));
+  new google.visualization.PieChart(document.getElementById('regionChart')).draw(dt, {
+    pieHole: 0.45,
+    legend: { position: 'right', alignment: 'center', textStyle: { fontSize: 11 } },
+    chartArea: { left: 0, top: 10, bottom: 10, right: 0, width: '100%', height: '90%' },
+    backgroundColor: 'transparent'
+  });
+}
+
+function renderCategory(rows) {
+  const map = {};
+  rows.forEach(r => map[r.Product_Category] = (map[r.Product_Category]||0) + r.Total_Sales);
+  const palette = ['#0d6efd','#6610f2','#d63384','#fd7e14','#198754','#20c997','#dc3545'];
+  const dt = new google.visualization.DataTable();
+  dt.addColumn('string','Category');
+  dt.addColumn('number','Sales');
+  dt.addColumn({type:'string', role:'style'});
+  Object.entries(map).sort((a,b)=>b[1]-a[1]).forEach(([k,v],i) =>
+    dt.addRow([k, v, palette[i % palette.length]]));
+  new google.visualization.BarChart(document.getElementById('categoryChart')).draw(dt, {
+    legend: { position: 'none' },
+    hAxis: { format: 'short' },
+    chartArea: { left: 100, right: 30, top: 10, bottom: 40, width: '100%', height: '85%' },
+    backgroundColor: 'transparent'
+  });
+}
+
+function renderRating(rows) {
+  const acc = {};
+  rows.forEach(r => {
+    if (!acc[r.Product_Category]) acc[r.Product_Category] = { s: 0, n: 0 };
+    acc[r.Product_Category].s += r.Customer_Rating;
+    acc[r.Product_Category].n += 1;
+  });
+  const dt = new google.visualization.DataTable();
+  dt.addColumn('string', 'Category');
+  dt.addColumn('number', 'Avg Rating');
+  Object.entries(acc).sort().forEach(([k,v]) => dt.addRow([k, v.s / v.n]));
+  new google.visualization.ColumnChart(document.getElementById('ratingChart')).draw(dt, {
+    legend: { position: 'none' },
+    vAxis: { viewWindow: { min: 0, max: 5 }, format: '0.0' },
+    colors: ['#ffc107'],
+    chartArea: { left: 50, right: 20, top: 20, bottom: 50, width: '100%', height: '75%' },
+    backgroundColor: 'transparent'
+  });
+}
+
+function renderStacked(rows) {
+  const cats = [...new Set(rows.map(r => r.Product_Category))].sort();
+  const grid = {};
+  rows.forEach(r => {
+    grid[r.Region] = grid[r.Region] || {};
+    grid[r.Region][r.Product_Category] = (grid[r.Region][r.Product_Category] || 0) + r.Total_Sales;
+  });
+  const header = ['Region', ...cats];
+  const dataRows = Object.keys(grid).sort().map(reg => [reg, ...cats.map(c => grid[reg][c] || 0)]);
+  const dt = google.visualization.arrayToDataTable([header, ...dataRows]);
+  new google.visualization.ColumnChart(document.getElementById('stackedChart')).draw(dt, {
+    isStacked: true,
+    legend: { position: 'top', maxLines: 2 },
+    chartArea: { left: 70, right: 20, top: 50, bottom: 50, width: '100%', height: '70%' },
+    vAxis: { format: 'short' },
+    colors: ['#0d6efd','#6610f2','#d63384','#fd7e14','#198754','#20c997','#dc3545'],
+    backgroundColor: 'transparent'
+  });
+}
+
+function renderMember(rows) {
+  let m = 0, n = 0;
+  rows.forEach(r => r.Is_Member ? m += r.Total_Sales : n += r.Total_Sales);
+  const dt = google.visualization.arrayToDataTable([
+    ['Type','Sales'],
+    ['Members', m],
+    ['Non-Members', n]
+  ]);
+  new google.visualization.PieChart(document.getElementById('memberChart')).draw(dt, {
+    pieHole: 0.55,
+    colors: ['#198754','#adb5bd'],
+    legend: { position: 'bottom' },
+    chartArea: { left: 0, top: 10, bottom: 40, right: 0, width: '100%', height: '78%' },
+    pieSliceTextStyle: { color: 'white' },
+    backgroundColor: 'transparent'
+  });
+}
+
+/* ---------------------- table ---------------------- */
+function renderTable(rows) {
+  const slice = rows.slice(0, 200);
+  const tbody = document.querySelector('#dataTable tbody');
+  tbody.innerHTML = slice.map(r => `
+    <tr>
+      <td>${r.Transaction_ID}</td>
+      <td>${r.Date}</td>
+      <td>${r.Region}</td>
+      <td>${r.Product_Category}</td>
+      <td>${r.Product_SKU}</td>
+      <td class="text-end">${r.Quantity}</td>
+      <td class="text-end">${usd(r.Unit_Price)}</td>
+      <td class="text-end fw-semibold">${usd(r.Total_Sales)}</td>
+      <td class="text-center">${'★'.repeat(r.Customer_Rating)}</td>
+      <td class="text-center">
+        <span class="badge ${r.Is_Member ? 'bg-success' : 'bg-secondary'}">
+          ${r.Is_Member ? 'Yes' : 'No'}
+        </span>
+      </td>
+    </tr>`).join('');
+  document.getElementById('tableInfo').textContent =
+    `Showing ${slice.length.toLocaleString()} of ${rows.length.toLocaleString()} rows`;
+}
+
+/* ---------------------- UI states ---------------------- */
+function showLoader(on) {
+  document.getElementById('loader').classList.toggle('d-none', !on);
+  if (on) {
+    document.getElementById('dashboard').classList.add('d-none');
+    document.getElementById('errorBox').classList.add('d-none');
+    document.getElementById('emptyBox').classList.add('d-none');
+  }
+}
+function showError(msg) {
+  showLoader(false);
+  const box = document.getElementById('errorBox');
+  box.classList.remove('d-none');
+  box.textContent = 'Error: ' + msg;
+}
+</script>
